@@ -1,19 +1,17 @@
-# Mini Vision Transformer per Segmentazione Semantica (stile didattico)
-# Dipendenze: torch, torchvision, pillow
-
+# train.py  —  (tua versione, modifiche minime)
 import os, random
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from PIL import Image
-from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
-
+from PIL import ImageOps, ImageFilter
+import numpy as np, glob
 # ------------------ iperparametri ------------------
 batch_size = 8
-image_size = 256           # lato lungo dopo il resize
-patch_size = 16            # patch quadrate P x P
-max_iters = 2000
+image_size = 256
+patch_size = 8
+max_iters = 1500
 eval_interval = 200
 learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -22,80 +20,103 @@ n_embd = 384
 n_head = 6
 n_layer = 6
 dropout = 0.1
-n_classes = 21            # cambia secondo il tuo dataset
-data_root = 'data'       # data/images/*.jpg  e  data/masks/*.png
+n_classes = 5
+data_root = '.'
 seed = 1337
+weights_path = 'vit_seg.pt'  # <-- NEW
 # ---------------------------------------------------
 
 torch.manual_seed(seed)
 random.seed(seed)
 
-# ------------------ dataset ------------------
+def compute_class_weights(msk_dir, n_classes, device):
+    counts = np.zeros(n_classes, dtype=np.int64)
+    for p in glob.glob(os.path.join(msk_dir, '*.png')):
+        a = np.array(Image.open(p))
+        vals, cnts = np.unique(a, return_counts=True)
+        for v, c in zip(vals, cnts):
+            if 0 <= v < n_classes:
+                counts[v] += c
+    freqs = counts / counts.sum()
+    nz = freqs[freqs > 0]
+    med = np.median(nz) if len(nz) else 1.0
+    w = np.zeros_like(freqs, dtype=np.float32)
+    w[freqs > 0] = med / freqs[freqs > 0]      # “median frequency balancing”
+    # opzionale: limita gli estremi
+    w = np.clip(w, 0.5, 5.0)
+    return torch.tensor(w, device=device)
+
+CLASS_W = compute_class_weights(os.path.join(data_root, 'masks'), n_classes, device)
+print("Class weights:", CLASS_W.tolist())
+
+def _prep(img):
+    g = img.convert('L')
+    g = ImageOps.autocontrast(g)
+    g = ImageOps.invert(ImageOps.invert(g).filter(ImageFilter.MaxFilter(3)))
+    return g.convert('RGB')
+
+def _is_img(fname):
+    f = fname.lower()
+    return f.endswith(('.jpg','.jpeg','.png','.bmp','.tif','.tiff'))
+
 class SegFolderDataset(Dataset):
-    """
-    Si aspetta:
-      root/images/*.jpg|png  immagini RGB
-      root/masks/*.png       maschere con ID di classe per pixel (uint8)
-    """
     def __init__(self, root, image_size, split='train', split_ratio=0.9):
-        img_dir = os.path.join(root, 'images')
-        msk_dir = os.path.join(root, 'masks')
-        names = sorted([os.path.splitext(f)[0] for f in os.listdir(img_dir)
-                        if f.lower().endswith(('.jpg','.jpeg','.png'))])
-        self.items = [(os.path.join(img_dir, n + os.path.splitext(f)[1]),
-                       os.path.join(msk_dir, n + '.png'))
-                      for n in names for f in [next(x for x in os.listdir(img_dir) if x.startswith(n))]]
-        # split semplice e riproducibile
-        random.Random(seed).shuffle(self.items)
-        k = int(len(self.items)*split_ratio)
-        self.items = self.items[:k] if split=='train' else self.items[k:]
-        self.im_tf = transforms.Compose([
-            transforms.Resize((image_size, image_size), interpolation=Image.BILINEAR),
-            transforms.ToTensor()
-        ])
-        self.ms_tf = transforms.Compose([
-            transforms.Resize((image_size, image_size), interpolation=Image.NEAREST)
-        ])
+        super().__init__()
+        self.root = root
+        self.image_size = image_size
+        self.img_dir = os.path.join(root, 'images')
+        self.msk_dir = os.path.join(root, 'masks')
+        if not os.path.isdir(self.img_dir): raise FileNotFoundError(f"images/ non trovata: {self.img_dir}")
+        if not os.path.isdir(self.msk_dir): raise FileNotFoundError(f"masks/ non trovata: {self.msk_dir}")
+        imgs = sorted([f for f in os.listdir(self.img_dir) if _is_img(f)])
+        pairs = []
+        for f in imgs:
+            base, _ = os.path.splitext(f)
+            mpath = os.path.join(self.msk_dir, base + '.png')
+            ipath = os.path.join(self.img_dir, f)
+            if os.path.isfile(mpath):
+                pairs.append((ipath, mpath))
+        if not pairs: raise RuntimeError("Nessuna coppia immagine/maschera trovata.")
+        random.Random(seed).shuffle(pairs)
+        k = int(len(pairs)*split_ratio)
+        self.items = pairs[:k] if split=='train' else pairs[k:]
 
     def __len__(self): return len(self.items)
 
     def __getitem__(self, idx):
+        import numpy as np
         ipath, mpath = self.items[idx]
-        img = Image.open(ipath).convert('RGB')
-        msk = Image.open(mpath)         # deve contenere ID di classe
-        img = self.im_tf(img)           # [3,H,W] float32 in [0,1]
-        msk = torch.from_numpy(
-            torch.ByteTensor(torch.ByteStorage.from_buffer(self.ms_tf(msk).tobytes()))
-            .numpy()
-        )  # workaround per preservare indici; alternativa: torchvision.transforms.PILToTensor()
-        msk = msk.view(image_size, image_size).long()  # [H,W] int64
-        return img, msk
+        img = _prep(Image.open(ipath))
+        msk = Image.open(mpath).convert('L')
+        img = img.resize((self.image_size, self.image_size), resample=Image.Resampling.BILINEAR)
+        msk = msk.resize((self.image_size, self.image_size), resample=Image.Resampling.NEAREST)
+        arr_img = np.array(img, copy=True)    # evita warning “non writable”
+        arr_msk = np.array(msk, copy=True)
+        img_t = torch.from_numpy(arr_img).permute(2,0,1).float() / 255.0
+        mask_t = torch.from_numpy(arr_msk).long()
+        return img_t, mask_t
 
-# loader
-train_ds = SegFolderDataset(data_root, image_size, 'train')
-val_ds   = SegFolderDataset(data_root, image_size, 'val')
-train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2)
-val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False, num_workers=2)
+def make_loaders():
+    train_ds = SegFolderDataset(data_root, image_size, 'train')
+    val_ds   = SegFolderDataset(data_root, image_size, 'val')
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  drop_last=True,  num_workers=0, pin_memory=(device=='cuda'))
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False, num_workers=0, pin_memory=(device=='cuda'))
+    return train_loader, val_loader
 
-# ------------------ ViT componenti ------------------
 class Head(nn.Module):
-    """Una testa di self-attention (non causale)."""
     def __init__(self, head_size):
         super().__init__()
         self.key   = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.dropout = nn.Dropout(dropout)
-
     def forward(self, x):
         B,T,C = x.shape
-        k = self.key(x)               # (B,T,hs)
-        q = self.query(x)             # (B,T,hs)
-        v = self.value(x)             # (B,T,hs)
-        wei = q @ k.transpose(-2,-1) * (k.shape[-1]**-0.5)  # (B,T,T)
-        wei = F.softmax(wei, dim=-1)                         # (B,T,T)
+        k = self.key(x); q = self.query(x); v = self.value(x)
+        wei = (q @ k.transpose(-2,-1)) * (k.shape[-1]**-0.5)
+        wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
-        out = wei @ v                                         # (B,T,hs)
+        out = wei @ v
         return out
 
 class MultiHeadAttention(nn.Module):
@@ -121,7 +142,6 @@ class FeedForward(nn.Module):
     def forward(self, x): return self.net(x)
 
 class Block(nn.Module):
-    """Encoder block ViT: LN->MHA+res, LN->MLP+res (pre-norm)."""
     def __init__(self, n_embd, n_head):
         super().__init__()
         head_size = n_embd // n_head
@@ -135,56 +155,44 @@ class Block(nn.Module):
         return x
 
 class ViTSegmenter(nn.Module):
-    """
-    Patch embedding -> +pos -> encoder transformer -> testa per classi per patch -> upsample a HxW.
-    """
     def __init__(self, image_size, patch_size, n_classes):
         super().__init__()
         assert image_size % patch_size == 0
         self.Hp = self.Wp = image_size // patch_size
         self.n_patches = self.Hp * self.Wp
-        self.patch_embed = nn.Conv2d(3, n_embd, kernel_size=patch_size, stride=patch_size)  # [B, C, Hp, Wp]
+        self.patch_embed = nn.Conv2d(3, n_embd, kernel_size=patch_size, stride=patch_size)
         self.pos_emb = nn.Parameter(torch.zeros(1, self.n_patches, n_embd))
         self.blocks = nn.Sequential(*[Block(n_embd, n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, n_classes)
-
-        # init semplice
+        self.lm_head = nn.Linear(n_embd, n_classes)
         self.apply(self._init_weights)
-
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=0.02);
+            nn.init.normal_(m.weight, std=0.02)
             if m.bias is not None: nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Conv2d):
             nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
             if m.bias is not None: nn.init.zeros_(m.bias)
-
     def forward(self, imgs, targets=None):
         B, _, H, W = imgs.shape
-        x = self.patch_embed(imgs)                  # (B, C, Hp, Wp)
-        x = x.flatten(2).transpose(1,2)             # (B, T, C) con T = Hp*Wp
-        x = x + self.pos_emb[:, :x.size(1), :]      # (B, T, C)
-        x = self.blocks(x)                          # (B, T, C)
+        x = self.patch_embed(imgs)
+        x = x.flatten(2).transpose(1,2)
+        x = x + self.pos_emb[:, :x.size(1), :]
+        x = self.blocks(x)
         x = self.ln_f(x)
-        logits_patch = self.head(x)                 # (B, T, n_classes)
+        logits_patch = self.lm_head(x)
         logits = logits_patch.transpose(1,2).reshape(B, n_classes, self.Hp, self.Wp)
-        logits = F.interpolate(logits, size=(H,W), mode='bilinear', align_corners=False)  # (B, n_classes, H, W)
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits, targets)  # targets: (B,H,W) long
+        logits = F.interpolate(logits, size=(H,W), mode='bilinear', align_corners=False)
+        loss = F.cross_entropy(logits, targets, weight=CLASS_W) if targets is not None else None
         return logits, loss
-
     @torch.no_grad()
     def predict(self, imgs):
         self.eval()
         logits, _ = self(imgs)
-        return logits.argmax(1)   # (B,H,W) class ids
+        return logits.argmax(1)
 
-# ------------------ training & eval ------------------
 @torch.no_grad()
-def estimate_loss(model):
+def estimate_loss(model, train_loader, val_loader):
     model.eval()
     def run(loader, steps):
         losses = []
@@ -198,31 +206,33 @@ def estimate_loss(model):
     model.train()
     return out
 
-model = ViTSegmenter(image_size, patch_size, n_classes).to(device)
-print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
+def run():
+    train_loader, val_loader = make_loaders()
+    model = ViTSegmenter(image_size, patch_size, n_classes).to(device)
+    print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.02)
+    step = 0
+    while step < max_iters:
+        for xb, yb in train_loader:
+            if step % eval_interval == 0 or step == max_iters-1:
+                losses = estimate_loss(model, train_loader, val_loader)
+                print(f"step {step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+            xb, yb = xb.to(device), yb.to(device)
+            _, loss = model(xb, yb)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            step += 1
+            if step >= max_iters: break
+    torch.save(model.state_dict(), weights_path)  # <-- NEW
+    print(f"Salvato: {weights_path}")            # <-- NEW
+    model.eval()
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            xb = xb.to(device)
+            pred = model.predict(xb)[0].cpu().numpy()
+            print("Pred shape:", pred.shape)
+            break
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-
-step = 0
-while step < max_iters:
-    for xb, yb in train_loader:
-        if step % eval_interval == 0 or step == max_iters-1:
-            losses = estimate_loss(model)
-            print(f"step {step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
-        xb, yb = xb.to(device), yb.to(device)
-        logits, loss = model(xb, yb)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-        step += 1
-        if step >= max_iters: break
-
-# ------------------ inferenza esempio ------------------
-# img_tensor shape: [1,3,H,W] in [0,1]; qui prendiamo un batch dalla val
-model.eval()
-with torch.no_grad():
-    for xb, yb in val_loader:
-        xb = xb.to(device)
-        pred = model.predict(xb)[0].cpu().numpy()  # (H,W) int
-        print("Pred shape:", pred.shape)
-        break
+if __name__ == "__main__":
+    run()
